@@ -1,0 +1,111 @@
+#!/bin/bash
+# Script de instalación y configuración de OpenVPN con autenticación de usuario y contraseña
+# Seguridad reforzada con TLS-Crypt, AES-256-GCM y firewall configurado
+# @author h3st4k3r 2025
+
+set -e  # Detener ejecución en caso de error
+
+### VARIABLES ###
+VPN_NET="10.8.0.0/24"
+VPN_IFACE="tun0"
+EXT_IFACE=$(ip route | grep default | awk '{print $5}')
+VPN_PORT=1194
+OPENVPN_DIR="/etc/openvpn"
+EASYRSA_DIR="/root/openvpn-ca"
+
+### 1. Instalación de paquetes necesarios ###
+echo "[+] Instalando OpenVPN y dependencias..."
+apt update && apt upgrade -y
+apt install -y openvpn easy-rsa iptables-persistent
+
+### 2. Configuración de Easy-RSA y generación de certificados ###
+echo "[+] Configurando Easy-RSA..."
+mkdir -p "$EASYRSA_DIR"
+cd "$EASYRSA_DIR"
+easyrsa init-pki
+easyrsa build-ca nopass
+easyrsa gen-req servidor nopass
+easyrsa sign-req server servidor
+easyrsa gen-dh
+openvpn --genkey --secret ta.key
+
+### 3. Mover archivos a /etc/openvpn ###
+echo "[+] Moviendo certificados y claves a OpenVPN..."
+mv "$EASYRSA_DIR"/pki/{ca.crt,issued/servidor.crt,private/servidor.key,dh.pem} "$OPENVPN_DIR"/
+mv "$EASYRSA_DIR"/ta.key "$OPENVPN_DIR"/
+
+### 4. Configurar OpenVPN con autenticación por usuario y contraseña ###
+echo "[+] Configurando OpenVPN..."
+cat > "$OPENVPN_DIR/server.conf" <<EOF
+port $VPN_PORT
+proto udp
+dev tun
+ca ca.crt
+cert servidor.crt
+key servidor.key
+dh dh.pem
+tls-crypt ta.key
+cipher AES-256-GCM
+auth SHA256
+keepalive 10 120
+user nobody
+group nogroup
+persist-key
+persist-tun
+explicit-exit-notify 1
+client-to-client
+server $VPN_NET 255.255.255.0
+push "route $VPN_NET 255.255.255.0"
+plugin /usr/lib/openvpn/plugins/openvpn-plugin-auth-pam.so login
+verify-client-cert optional
+EOF
+
+### 5. Habilitar reenvío de paquetes ###
+echo "[+] Habilitando reenvío de paquetes..."
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
+
+### 6. Configurar reglas de firewall ###
+echo "[+] Configurando firewall..."
+iptables -A INPUT -p udp --dport $VPN_PORT -j ACCEPT
+iptables -A FORWARD -s $VPN_NET -j ACCEPT
+iptables -t nat -A POSTROUTING -s $VPN_NET -o $EXT_IFACE -j MASQUERADE
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -i $VPN_IFACE -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT  # Permitir SSH
+iptables -A INPUT -j DROP
+netfilter-persistent save
+
+### 7. Crear usuario VPN ###
+echo "[+] Creando usuario para autenticación..."
+read -p "Introduce el nombre del usuario VPN: " VPN_USER
+adduser "$VPN_USER"
+
+### 8. Iniciar OpenVPN ###
+echo "[+] Iniciando OpenVPN..."
+systemctl restart openvpn@server
+systemctl enable openvpn@server
+
+### 9. Información final para configurar el cliente ###
+echo "[+] Configuración completa. Para configurar el cliente, sigue estos pasos:"
+echo "1. Copia el archivo ta.key desde el servidor:"
+echo "   scp $OPENVPN_DIR/ta.key usuario@IP_CLIENTE:/home/usuario/"
+echo "2. Crea un archivo cliente.ovpn con la siguiente configuración:"
+cat <<EOL
+client
+dev tun
+proto udp
+remote IP_DEL_SERVIDOR $VPN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-GCM
+auth SHA256
+tls-crypt ta.key
+auth-user-pass
+verb 3
+EOL
+echo "3. Importa el archivo .ovpn en la aplicación OpenVPN y conéctate usando el usuario y contraseña configurados."
+echo "[+] ¡VPN configurada correctamente!"
